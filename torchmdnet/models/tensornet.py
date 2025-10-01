@@ -46,6 +46,18 @@ def vector_to_symtensor(vector):
     S = 0.5 * (tensor + tensor.transpose(-2, -1)) - I
     return S
 
+def skewtensor_to_vector(A):
+    """
+    Map an antisymmetric tensor A to its pseudovector w s.t.
+    [ [0, -wz,  wy],
+      [wz,  0, -wx],
+      [-wy, wx, 0] ] == A
+    A: [..., 3, 3]  ->  w: [..., 3]
+    """
+    wx = A[..., 2, 1]
+    wy = A[..., 0, 2]
+    wz = -A[..., 0, 1]
+    return torch.stack((wx, wy, wz), dim=-1)
 
 def decompose_tensor(tensor):
     """Full tensor decomposition into irreducible components."""
