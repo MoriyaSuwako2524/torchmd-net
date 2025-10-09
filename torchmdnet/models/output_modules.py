@@ -58,6 +58,8 @@ class OutputModel(nn.Module, metaclass=ABCMeta):
         return x
 
 
+
+
 class Scalar(OutputModel):
     def __init__(
         self,
