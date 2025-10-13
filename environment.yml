@@ -1,4 +1,4 @@
-name: torchmd-net
+name: torchmdnet
 channels:
   - conda-forge
 dependencies:

@@ -48,6 +48,7 @@ class Custom(Dataset):
         embedglob,
         energyglob=None,
         forceglob=None,
+        dipolelob=None,
         preload_memory_limit=1024,
         transform=None,
         pre_transform=None,
@@ -59,6 +60,7 @@ class Custom(Dataset):
         )
         self.has_energies = energyglob is not None
         self.has_forces = forceglob is not None
+        self.has_dipole = dipolelob is not None
         self.fields = [
             ("pos", "pos", torch.float32),
             ("z", "types", torch.long),
@@ -84,12 +86,20 @@ class Custom(Dataset):
                 f"Number of coordinate files {len(self.files['pos'])} "
                 f"does not match number of force files {len(self.files['neg_dy'])}."
             )
+        if self.has_dipole:
+            self.files["vec"] = sorted(glob.glob(dipolelob))
+            self.fields.append(("vec", "dipole", torch.float32))
+            assert len(self.files["pos"]) == len(self.files["vec"]), (
+                f"Number of coordinate files {len(self.files['pos'])} "
+                f"does not match number of force files {len(self.files['vec'])}."
+            )
         print("Number of files: ", len(self.files["pos"]))
         self.cached = False
         total_data_size = self._initialize_index()
         print(f"Combined dataset size {len(self.index)}")
         # If the dataset is small enough, load it whole into CPU memory
         data_size_limit = preload_memory_limit * 1024 * 1024
+
         if total_data_size < data_size_limit:
             self.cached = True
             print(
@@ -121,6 +131,10 @@ class Custom(Dataset):
             self.stored_data["neg_dy"] = [
                 torch.from_numpy(np.load(f)) for f in self.files["neg_dy"]
             ]
+        if self.has_dipole:
+            self.stored_data["vec"] = [
+                torch.from_numpy(np.load(f)) for f in self.files["vec"]
+            ]
 
     def _store_numpy_memmaps(self):
         """Create a dictionary with numpy arrays with mmap_mode="r" for each file."""
@@ -140,6 +154,11 @@ class Custom(Dataset):
             self.stored_data["neg_dy"] = [
                 np.load(f, mmap_mode="r") for f in self.files["neg_dy"]
             ]
+        if self.has_dipole:
+            self.stored_data["vec"] = [
+                np.load(f, mmap_mode="r") for f in self.files["vec"]
+            ]
+
 
     def _initialize_index(self):
         """Initialize the index for the dataset.
@@ -176,16 +195,25 @@ class Custom(Dataset):
                     f"Data shape of coordinate file {i} {coord_data.shape} "
                     f"does not match the shape of force file {i} {force_data.shape}."
                 )
+            if self.has_dipole:
+                dipole_data = np.load(self.files["vec"][i], mmap_mode="r")
+                total_data_size += dipole_data.nbytes
+                assert coord_data.shape[0] == dipole_data.shape[0], (
+                    f"Data shape of coordinate file {i} {coord_data.shape} "
+                    f"does not match the shape of force file {i} {dipole_data.shape}."
+                )
         return total_data_size
 
     def get(self, idx):
         fileid, index = self.index[idx]
         data = Data()
         for field in self.fields:
-            # The dataset is stored as mem mapped numpy arrays unless it is cached,
-            # in which case it is already stored as torch tensors
             f = self.stored_data[field[0]][fileid][index]
-            data[field[0]] = f if self.cached else torch.from_numpy(np.array(f))
+            f = f if self.cached else torch.from_numpy(np.array(f))
+            data[field[0]] = f
+    
+        if hasattr(data, "vec"):
+            data.vec = data.vec.view(1, -1)
         return data
 
     def len(self):
