@@ -101,7 +101,6 @@ if __name__ == "__main__":
         install_requires=[
             "h5py",
             # "nnpops",
-            "torch==2.7.1",
             "torch_geometric",
             "lightning",
             "tqdm",

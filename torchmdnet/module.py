@@ -150,8 +150,15 @@ class LNNP(LightningModule):
         q: Optional[Tensor] = None,
         s: Optional[Tensor] = None,
         extra_args: Optional[Dict[str, Tensor]] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        return self.model(z, pos, batch=batch, box=box, q=q, s=s, extra_args=extra_args)
+    ):
+        out = self.model(z, pos, batch=batch, box=box, q=q, s=s, extra_args=extra_args)
+        # ：tuple -> {"y": ..., "neg_dy": ...}
+        if isinstance(out, tuple):
+            y, neg_dy = out
+            return {"y": y, "neg_dy": neg_dy}
+        #  {"y": ..., "neg_dy": ..., "dipole": ...}
+        return out
+
 
     def training_step(self, batch, batch_idx):
         return self.step(
@@ -197,7 +204,7 @@ class LNNP(LightningModule):
                 extra_args=extra_args,
             )
 
-    def _compute_losses(self, y, neg_y, batch, loss_fn, loss_name, stage):
+    def _compute_losses(self, y, neg_y,vec, batch, loss_fn, loss_name, stage):
         # Compute the loss for the predicted value and the negative derivative (if available)
         # Args:
         #   y: predicted value
@@ -208,18 +215,26 @@ class LNNP(LightningModule):
         # Returns:
         #   loss_y: loss for the predicted value
         #   loss_neg_y: loss for the predicted negative derivative
+        loss_dict = {}
         loss_y, loss_neg_y = torch.tensor(0.0, device=self.device), torch.tensor(
             0.0, device=self.device
         )
+        loss_vec = torch.tensor(0.0, device=self.device)
         if self.hparams.derivative and "neg_dy" in batch:
             loss_neg_y = loss_fn(neg_y, batch.neg_dy)
             loss_neg_y = self._update_loss_with_ema(
                 stage, "neg_dy", loss_name, loss_neg_y
             )
+            loss_dict["neg_dy"]= loss_neg_y
         if "y" in batch:
             loss_y = loss_fn(y, batch.y)
             loss_y = self._update_loss_with_ema(stage, "y", loss_name, loss_y)
-        return {"y": loss_y, "neg_dy": loss_neg_y}
+            loss_dict["y"]= loss_y
+        if "vec" in batch:
+            loss_vec = loss_fn(vec, batch.vec)
+            loss_vec = self._update_loss_with_ema(stage, "vec", loss_name, loss_vec)
+            loss_dict["vec"]= loss_vec
+        return loss_dict
 
     def _update_loss_with_ema(self, stage, type, loss_name, loss):
         # Update the loss using an exponential moving average when applicable
@@ -253,20 +268,23 @@ class LNNP(LightningModule):
         batch = self.data_transform(batch)
         with torch.set_grad_enabled(stage == "train" or self.hparams.derivative):
             extra_args = batch.to_dict()
-            for a in ("y", "neg_dy", "z", "pos", "batch", "box", "q", "s"):
+            for a in ("y", "neg_dy", "vec","z", "pos", "batch", "box", "q", "s"):
                 if a in extra_args:
                     del extra_args[a]
             # TODO: the model doesn't necessarily need to return a derivative once
             # Union typing works under TorchScript (https://github.com/pytorch/pytorch/pull/53180)
-            y, neg_dy = self(
-                batch.z,
-                batch.pos,
-                batch=batch.batch,
-                box=batch.box if "box" in batch else None,
-                q=batch.q if self.hparams.charge else None,
-                s=batch.s if self.hparams.spin else None,
-                extra_args=extra_args,
-            )
+                pred = self(
+                    batch.z,
+                    batch.pos,
+                    batch=batch.batch,
+                    box=batch.box if "box" in batch else None,
+                    q=batch.q if self.hparams.charge else None,
+                    s=batch.s if self.hparams.spin else None,
+                    extra_args=extra_args,
+                )
+                y = pred.get("y", None)
+                neg_dy = pred.get("neg_dy", None)
+                vec = pred.get("vec", None)
         if self.hparams.derivative and "y" not in batch:
             # "use" both outputs of the model's forward function but discard the first
             # to only use the negative derivative and avoid 'Expected to have finished reduction
@@ -277,7 +295,7 @@ class LNNP(LightningModule):
             batch.y = batch.y.unsqueeze(1)
         for loss_name, loss_fn in loss_fn_list:
             step_losses = self._compute_losses(
-                y, neg_dy, batch, loss_fn, loss_name, stage
+                y, neg_dy,vec, batch, loss_fn, loss_name, stage
             )
             if self.hparams.neg_dy_weight > 0:
                 self.losses[stage]["neg_dy"][loss_name].append(
@@ -285,11 +303,15 @@ class LNNP(LightningModule):
                 )
             if self.hparams.y_weight > 0:
                 self.losses[stage]["y"][loss_name].append(step_losses["y"].detach())
+            if self.hparams.dipole_weight > 0:
+                self.losses[stage]["vec"][loss_name].append(step_losses["vec"].detach())
             total_loss = (
                 step_losses["y"] * self.hparams.y_weight
                 + step_losses["neg_dy"] * self.hparams.neg_dy_weight
+                + step_losses["vec"] * self.hparams.dipole_weight
             )
             self.losses[stage]["total"][loss_name].append(total_loss.detach())
+
         return total_loss
 
     def optimizer_step(self, *args, **kwargs):
@@ -332,6 +354,7 @@ class LNNP(LightningModule):
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
             result_dict.update(self._get_mean_loss_dict_for_type("y"))
             result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
+            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
             self.log_dict(result_dict, sync_dist=True)
 
         self._reset_losses_dict()
@@ -343,6 +366,7 @@ class LNNP(LightningModule):
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
             result_dict.update(self._get_mean_loss_dict_for_type("y"))
             result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
+            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
             # Get only test entries
             result_dict = {k: v for k, v in result_dict.items() if k.startswith("test")}
             self.log_dict(result_dict, sync_dist=True)
@@ -354,6 +378,7 @@ class LNNP(LightningModule):
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
             result_dict.update(self._get_mean_loss_dict_for_type("y"))
             result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
+            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
             # Get only train entries
             result_dict = {
                 k: v for k, v in result_dict.items() if k.startswith("train")
@@ -368,12 +393,12 @@ class LNNP(LightningModule):
         self.losses = {}
         for stage in ["train", "val", "test"]:
             self.losses[stage] = {}
-            for loss_type in ["total", "y", "neg_dy"]:
+            for loss_type in ["total", "y", "neg_dy","vec"]:
                 self.losses[stage][loss_type] = defaultdict(list)
 
     def _reset_ema_dict(self):
         self.ema = {}
         for stage in ["train", "val"]:
             self.ema[stage] = {}
-            for loss_type in ["y", "neg_dy"]:
+            for loss_type in ["y", "neg_dy","vec"]:
                 self.ema[stage][loss_type] = {}

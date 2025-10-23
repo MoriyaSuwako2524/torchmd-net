@@ -131,16 +131,42 @@ def create_model(args, prior_model=None, mean=None, std=None):
     )
 
     # combine representation and output network
-    model = TorchMD_Net(
-        representation_model,
-        output_model,
-        prior_model=prior_model,
-        mean=mean,
-        std=std,
-        derivative=args["derivative"],
-        dtype=dtype,
-    )
+    # ==========================================================
+    if args.get("predict_dipole", False):
+        from torchmdnet.models.output_modules import DipoleMoment
+
+        dipole_output = DipoleMoment(
+            args["embedding_dimension"],
+            activation=args["activation"],
+            reduce_op=args["reduce_op"],
+            dtype=dtype,
+            num_hidden_layers=args.get("output_mlp_num_layers", 0),
+        )
+
+        model = TorchMD_Net_Dipole(
+            representation_model,
+            output_model,
+            dipole_output,
+            prior_model=prior_model,
+            mean=mean,
+            std=std,
+            derivative=args["derivative"],
+            dtype=dtype,
+        )
+    else:
+        # default single-output version (energy + forces)
+        model = TorchMD_Net(
+            representation_model,
+            output_model,
+            prior_model=prior_model,
+            mean=mean,
+            std=std,
+            derivative=args["derivative"],
+            dtype=dtype,
+        )
+
     return model
+
 
 
 def load_ensemble(filepath, args=None, device="cpu", return_std=False, **kwargs):
@@ -504,6 +530,130 @@ class TorchMD_Net(nn.Module):
         # Returning an empty tensor allows to decorate this method as always returning two tensors.
         # This is required to overcome a TorchScript limitation, xref https://github.com/openmm/openmm-torch/issues/135
         return y, torch.empty(0)
+
+
+class TorchMD_Net_Dipole(nn.Module):
+    """TorchMD-Net variant with dipole moment prediction.
+
+    Same structure as TorchMD_Net, but returns an additional vector output 'vec'
+    corresponding to the molecular dipole moment.
+    """
+
+    def __init__(
+        self,
+        representation_model,
+        output_model,
+        dipole_output,
+        prior_model=None,
+        mean=None,
+        std=None,
+        derivative=False,
+        dtype=torch.float32,
+    ):
+        super(TorchMD_Net_Dipole, self).__init__()
+        self.representation_model = representation_model.to(dtype=dtype)
+        self.output_model = output_model.to(dtype=dtype)
+        self.dipole_output = dipole_output.to(dtype=dtype)
+
+        if not output_model.allow_prior_model and prior_model is not None:
+            prior_model = None
+            rank_zero_warn(
+                (
+                    "Prior model was given but the output model does "
+                    "not allow prior models. Dropping the prior model."
+                )
+            )
+        if isinstance(prior_model, priors.base.BasePrior):
+            prior_model = [prior_model]
+        self.prior_model = (
+            None
+            if prior_model is None
+            else torch.nn.ModuleList(prior_model).to(dtype=dtype)
+        )
+
+        self.derivative = derivative
+        mean = torch.scalar_tensor(0) if mean is None else mean
+        self.register_buffer("mean", mean.to(dtype=dtype))
+        std = torch.scalar_tensor(1) if std is None else std
+        self.register_buffer("std", std.to(dtype=dtype))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.representation_model.reset_parameters()
+        self.output_model.reset_parameters()
+        self.dipole_output.reset_parameters()
+        if self.prior_model is not None:
+            for prior in self.prior_model:
+                prior.reset_parameters()
+
+    def forward(
+        self,
+        z: Tensor,
+        pos: Tensor,
+        batch: Optional[Tensor] = None,
+        box: Optional[Tensor] = None,
+        q: Optional[Tensor] = None,
+        s: Optional[Tensor] = None,
+        extra_args: Optional[Dict[str, Tensor]] = None,
+    ) -> Dict[str, Tensor]:
+        assert z.dim() == 1 and z.dtype == torch.long
+        batch = torch.zeros_like(z) if batch is None else batch
+
+        if self.derivative:
+            pos.requires_grad_(True)
+
+        # representation
+        x, v, z, pos, batch = self.representation_model(
+            z, pos, batch, box=box, q=q, s=s
+        )
+
+        # main energy output
+        x_e = self.output_model.pre_reduce(x, v, z, pos, batch)
+        if self.std is not None:
+            x_e = x_e * self.std
+        if self.prior_model is not None:
+            for prior in self.prior_model:
+                x_e = prior.pre_reduce(x_e, z, pos, batch, extra_args)
+        x_e = self.output_model.reduce(x_e, batch)
+        if self.mean is not None:
+            x_e = x_e + self.mean
+        y = self.output_model.post_reduce(x_e)
+        if self.prior_model is not None:
+            for prior in self.prior_model:
+                y = prior.post_reduce(y, z, pos, batch, box, extra_args)
+
+        # compute forces
+        if self.derivative:
+            grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(y)]
+            dy = grad(
+                [y],
+                [pos],
+                grad_outputs=grad_outputs,
+                create_graph=self.training,
+                retain_graph=self.training,
+            )[0]
+        else:
+            dy = torch.empty(0, device=pos.device)
+
+        # dipole output (vector)
+        x_d = self.dipole_output.pre_reduce(x, v, z, pos, batch)
+        vec = self.dipole_output.reduce(x_d, batch)
+
+        return {"y": y, "neg_dy": -dy, "vec": vec}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class Ensemble(torch.nn.ModuleList):
