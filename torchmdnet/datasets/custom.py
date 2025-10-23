@@ -89,6 +89,7 @@ class Custom(Dataset):
         if self.has_dipole:
             self.files["vec"] = sorted(glob.glob(dipolelob))
             self.fields.append(("vec", "dipole", torch.float32))
+            print("length test:",len(self.files["pos"]),len(self.files["vec"]))
             assert len(self.files["pos"]) == len(self.files["vec"]), (
                 f"Number of coordinate files {len(self.files['pos'])} "
                 f"does not match number of force files {len(self.files['vec'])}."
