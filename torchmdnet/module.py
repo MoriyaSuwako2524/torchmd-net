@@ -253,14 +253,16 @@ class LNNP(LightningModule):
                     del extra_args[a]
             # TODO: the model doesn't necessarily need to return a derivative once
             # Union typing works under TorchScript (https://github.com/pytorch/pytorch/pull/53180)
-                pred = self(
-                    batch.z, batch.pos,
-                    batch=batch.batch,
-                    box=batch.box if "box" in batch else None,
-                    q=batch.q if self.hparams.charge else None,
-                    s=batch.s if self.hparams.spin else None,
-                    extra_args=extra_args,
-                )
+            pred = self(
+                batch.z, batch.pos,
+                batch=batch.batch,
+                box=batch.box if "box" in batch else None,
+                q=batch.q if self.hparams.charge else None,
+                s=batch.s if self.hparams.spin else None,
+                extra_args=extra_args,
+            )
+        if hasattr(batch, "y") and batch.y.ndim == 1:
+            batch.y = batch.y.unsqueeze(1)
         loss_total = 0
         for loss_name, loss_fn in loss_fn_list:
             step_losses = self._compute_losses(pred, batch, loss_fn, loss_name, stage)
@@ -270,6 +272,7 @@ class LNNP(LightningModule):
                     self.losses[stage][key][loss_name].append(loss_value.detach())
                     loss_total += weight * loss_value
             self.losses[stage]["total"][loss_name].append(loss_total.detach())
+        return loss_total
 
     def optimizer_step(self, *args, **kwargs):
         optimizer = kwargs["optimizer"] if "optimizer" in kwargs else args[2]

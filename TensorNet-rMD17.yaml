@@ -15,8 +15,8 @@ embedding_dimension: 128
 energy_files: null
 equivariance_invariance_group: O(3)
 y_weight: 1
-force_files: null
 neg_dy_weight: 1
+force_files: null
 gradient_clipping: 40.0
 inference_batch_size: 8
 load_model: null
