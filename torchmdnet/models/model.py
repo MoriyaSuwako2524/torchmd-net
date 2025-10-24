@@ -130,12 +130,25 @@ def create_model(args, prior_model=None, mean=None, std=None):
         num_hidden_layers=args.get("output_mlp_num_layers", 0),
     )
 
-    # combine representation and output network
     # ==========================================================
-    if args.get("predict_dipole", False):
-        from torchmdnet.models.output_modules import DipoleMoment
+    # Dynamic multi-output construction
+    # ==========================================================
 
-        dipole_output = DipoleMoment(
+    pred_dict = args.get("pred_dict", {"y": 1.0, "neg_dy": 1.0})
+    output_modules_dict = {}
+
+    # always include main scalar output
+    output_modules_dict["y"] = getattr(output_modules, output_prefix + args["output_model"])(
+        args["embedding_dimension"],
+        activation=args["activation"],
+        reduce_op=args["reduce_op"],
+        dtype=dtype,
+        num_hidden_layers=args.get("output_mlp_num_layers", 0),
+    )
+
+    # add extra requested outputs
+    if "vec" in pred_dict:
+        output_modules_dict["vec"] = output_modules.DipoleMoment(
             args["embedding_dimension"],
             activation=args["activation"],
             reduce_op=args["reduce_op"],
@@ -143,27 +156,27 @@ def create_model(args, prior_model=None, mean=None, std=None):
             num_hidden_layers=args.get("output_mlp_num_layers", 0),
         )
 
-        model = TorchMD_Net_Dipole(
-            representation_model,
-            output_model,
-            dipole_output,
-            prior_model=prior_model,
-            mean=mean,
-            std=std,
-            derivative=args["derivative"],
+    if "charge" in pred_dict:
+        from torchmdnet.models.output_modules import AtomicCharge
+        output_modules_dict["charge"] = AtomicCharge(
+            args["embedding_dimension"],
+            activation=args["activation"],
+            reduce_op=args["reduce_op"],
             dtype=dtype,
         )
-    else:
-        # default single-output version (energy + forces)
-        model = TorchMD_Net(
-            representation_model,
-            output_model,
-            prior_model=prior_model,
-            mean=mean,
-            std=std,
-            derivative=args["derivative"],
-            dtype=dtype,
-        )
+
+    # extend here for more (polar, esp, etc.)
+    # ==========================================================
+
+    model = TorchMD_Net_MultiOutput(
+        representation_model,
+        output_modules_dict,
+        prior_model=prior_model,
+        mean=mean,
+        std=std,
+        derivative=args["derivative"],
+        dtype=dtype,
+    )
 
     return model
 
@@ -646,16 +659,6 @@ class TorchMD_Net_Dipole(nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
 class Ensemble(torch.nn.ModuleList):
     """Average predictions over an ensemble of TorchMD-Net models.
 
@@ -703,3 +706,73 @@ class Ensemble(torch.nn.ModuleList):
             return y_mean, neg_dy_mean, y_std, neg_dy_std
         else:
             return y_mean, neg_dy_mean
+
+
+
+class TorchMD_Net_MultiOutput(nn.Module):
+    """
+    TorchMD-Net variant that supports multiple parallel output heads.
+
+    Returns a dict with keys corresponding to each physical quantity, e.g.
+    {"y": energy, "neg_dy": forces, "vec": dipole, "charge": charge, ...}
+    """
+
+    def __init__(
+        self,
+        representation_model,
+        output_modules: Dict[str, nn.Module],
+        prior_model=None,
+        mean=None,
+        std=None,
+        derivative=False,
+        dtype=torch.float32,
+    ):
+        super().__init__()
+        self.representation_model = representation_model.to(dtype=dtype)
+        self.output_modules = nn.ModuleDict(output_modules)
+        self.prior_model = (
+            None
+            if prior_model is None
+            else torch.nn.ModuleList(prior_model).to(dtype=dtype)
+        )
+        self.derivative = derivative
+        mean = torch.scalar_tensor(0) if mean is None else mean
+        std = torch.scalar_tensor(1) if std is None else std
+        self.register_buffer("mean", mean.to(dtype=dtype))
+        self.register_buffer("std", std.to(dtype=dtype))
+
+    def forward(
+        self, z, pos, batch=None, box=None, q=None, s=None, extra_args=None
+    ):
+        batch = torch.zeros_like(z) if batch is None else batch
+        if self.derivative:
+            pos.requires_grad_(True)
+
+        x, v, z, pos, batch = self.representation_model(z, pos, batch, box=box, q=q, s=s)
+
+        results = {}
+        for key, outmod in self.output_modules.items():
+            # --- forward per-head ---
+            x_out = outmod.pre_reduce(x, v, z, pos, batch)
+            x_out = x_out * self.std
+            if self.prior_model is not None:
+                for prior in self.prior_model:
+                    x_out = prior.pre_reduce(x_out, z, pos, batch, extra_args)
+            x_out = outmod.reduce(x_out, batch)
+            x_out = x_out + self.mean
+            y = outmod.post_reduce(x_out)
+            if self.prior_model is not None:
+                for prior in self.prior_model:
+                    y = prior.post_reduce(y, z, pos, batch, box, extra_args)
+            results[key] = y
+
+        # --- compute forces if needed ---
+        if self.derivative and "y" in results:
+            grad_outputs = [torch.ones_like(results["y"])]
+            dy = grad([results["y"]], [pos],
+                      grad_outputs=grad_outputs,
+                      create_graph=self.training,
+                      retain_graph=self.training)[0]
+            results["neg_dy"] = -dy
+
+        return results

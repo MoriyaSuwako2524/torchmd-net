@@ -78,13 +78,28 @@ def get_argparse():
     parser.add_argument('--energy-files', default=None, type=str, help='Custom energy files glob')
     parser.add_argument('--predict-dipole', default=False, type=bool, help='Predict dipole')
     parser.add_argument('--dipole-files', default=None, type=str, help='Custom dipole files glob')
+    parser.add_argument('--charge-files', default=None, type=str, help='Custom dipole files glob')
     parser.add_argument('--force-files', default=None, type=str, help='Custom force files glob')
     parser.add_argument('--dataset-preload-limit', default=1024, type=int, help='Custom and HDF5 datasets will preload to RAM datasets that are less than this size in MB')
     parser.add_argument('--y-weight', default=1.0, type=float, help='Weighting factor for y label in the loss function')
     parser.add_argument('--neg-dy-weight', default=1.0, type=float, help='Weighting factor for neg_dy label in the loss function')
     parser.add_argument('--dipole-weight', default=1.0, type=float,help='Weighting factor for dipole label in the loss function')
+    parser.add_argument('--charge-weight', default=1.0, type=float,help='Weighting factor for charge label in the loss function')
     parser.add_argument('--train-loss', default='mse_loss', type=str, choices=loss_class_mapping.keys(), help='Loss function to use during training')
     parser.add_argument('--train-loss-arg', default=None, help='Additional arguments for the loss function. Needs to be a dictionary.')
+    parser.add_argument(
+        '--pred_dict',
+        type=lambda x: json.loads(x.replace("'", '"')),
+        default={"y": 1.0, "neg_dy": 1.0},
+        help='Dictionary of predicted properties and their loss weights'
+    )
+
+    parser.add_argument(
+        '--pred_file_dict',
+        type=lambda x: json.loads(x.replace("'", '"')),
+        default={"y": "full_energy.npy", "neg_dy": "full_force.npy"},
+        help='Dictionary mapping property name to dataset file name'
+    )
 
     # model architecture
     parser.add_argument('--model', type=str, default='graph-network', choices=models.__all_models__, help='Which model to train')

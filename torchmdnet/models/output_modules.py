@@ -16,7 +16,7 @@ from torchmdnet.utils import atomic_masses
 from torchmdnet.extensions.ops import is_current_stream_capturing
 from warnings import warn
 
-__all__ = ["Scalar", "DipoleMoment", "ElectronicSpatialExtent"]
+__all__ = ["Scalar", "DipoleMoment", "ElectronicSpatialExtent","AtomicCharge"]
 
 
 class OutputModel(nn.Module, metaclass=ABCMeta):
@@ -131,6 +131,54 @@ class EquivariantScalar(OutputModel):
             x, v = layer(x, v)
         # include v in output to make sure all parameters have a gradient
         return x + v.sum() * 0
+
+
+class AtomicCharge(OutputModel):
+    """Atomwise-weighted scalar output for predicting molecular or atomic charge.
+
+    Works analogously to DipoleMoment but without position weighting.
+    Can be trained either to reproduce per-atom charges or total molecular charge
+    (depending on the dataset reduction operation, e.g. 'sum' or 'mean').
+
+    Example:
+        >>> out = Charge(hidden_channels=128)
+        >>> y = out.pre_reduce(x, v, z, pos, batch)
+        >>> y.shape   # (n_atoms, 1)
+    """
+
+    def __init__(
+        self,
+        hidden_channels,
+        activation="silu",
+        reduce_op="sum",
+        dtype=torch.float,
+        **kwargs,
+    ):
+        super(Charge, self).__init__(
+            allow_prior_model=False, reduce_op=reduce_op
+        )
+        self.output_network = MLP(
+            in_channels=hidden_channels,
+            out_channels=1,
+            hidden_channels=hidden_channels // 2,
+            activation=activation,
+            num_hidden_layers=kwargs.get("num_layers", 0),
+            dtype=dtype,
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.output_network.reset_parameters()
+
+    def pre_reduce(self, x, v: Optional[torch.Tensor], z, pos, batch):
+        # Map atomic embeddings to per-atom partial charge contributions
+        return self.output_network(x)
+
+    def post_reduce(self, x):
+        # x has already been reduced across atoms (sum/mean).
+        # Return as single-component tensor per molecule.
+        return x
+
 
 
 class DipoleMoment(Scalar):

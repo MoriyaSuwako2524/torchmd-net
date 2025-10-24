@@ -87,6 +87,9 @@ class LNNP(LightningModule):
             self.model = load_model(self.hparams.load_model, args=self.hparams)
         else:
             self.model = create_model(self.hparams, prior_model, mean, std)
+        self.pred_dict = getattr(self.hparams, "pred_dict", {"y": 1.0, "neg_dy": 1.0})
+        self.pred_file_dict = getattr(self.hparams, "pred_file_dict", {})
+        self.pred_keys = list(self.pred_dict.keys())
 
         # initialize exponential smoothing
         self.ema = None
@@ -204,37 +207,14 @@ class LNNP(LightningModule):
                 extra_args=extra_args,
             )
 
-    def _compute_losses(self, y, neg_y,vec, batch, loss_fn, loss_name, stage):
-        # Compute the loss for the predicted value and the negative derivative (if available)
-        # Args:
-        #   y: predicted value
-        #   neg_y: predicted negative derivative
-        #   batch: batch of data
-        #   loss_fn: The loss function to compute
-        #   loss_name: The name of the loss function
-        # Returns:
-        #   loss_y: loss for the predicted value
-        #   loss_neg_y: loss for the predicted negative derivative
-        loss_dict = {}
-        loss_y, loss_neg_y = torch.tensor(0.0, device=self.device), torch.tensor(
-            0.0, device=self.device
-        )
-        loss_vec = torch.tensor(0.0, device=self.device)
-        if self.hparams.derivative and "neg_dy" in batch:
-            loss_neg_y = loss_fn(neg_y, batch.neg_dy)
-            loss_neg_y = self._update_loss_with_ema(
-                stage, "neg_dy", loss_name, loss_neg_y
-            )
-            loss_dict["neg_dy"]= loss_neg_y
-        if "y" in batch:
-            loss_y = loss_fn(y, batch.y)
-            loss_y = self._update_loss_with_ema(stage, "y", loss_name, loss_y)
-            loss_dict["y"]= loss_y
-        if "vec" in batch:
-            loss_vec = loss_fn(vec, batch.vec)
-            loss_vec = self._update_loss_with_ema(stage, "vec", loss_name, loss_vec)
-            loss_dict["vec"]= loss_vec
-        return loss_dict
+    def _compute_losses(self, pred_dict, batch, loss_fn, loss_name, stage):
+        loss_out = {}
+        for key in self.pred_keys:
+            if key in batch and key in pred_dict:
+                loss_value = loss_fn(pred_dict[key], getattr(batch, key))
+                loss_value = self._update_loss_with_ema(stage, key, loss_name, loss_value)
+                loss_out[key] = loss_value
+        return loss_out
 
     def _update_loss_with_ema(self, stage, type, loss_name, loss):
         # Update the loss using an exponential moving average when applicable
@@ -274,45 +254,22 @@ class LNNP(LightningModule):
             # TODO: the model doesn't necessarily need to return a derivative once
             # Union typing works under TorchScript (https://github.com/pytorch/pytorch/pull/53180)
                 pred = self(
-                    batch.z,
-                    batch.pos,
+                    batch.z, batch.pos,
                     batch=batch.batch,
                     box=batch.box if "box" in batch else None,
                     q=batch.q if self.hparams.charge else None,
                     s=batch.s if self.hparams.spin else None,
                     extra_args=extra_args,
                 )
-                y = pred.get("y", None)
-                neg_dy = pred.get("neg_dy", None)
-                vec = pred.get("vec", None)
-        if self.hparams.derivative and "y" not in batch:
-            # "use" both outputs of the model's forward function but discard the first
-            # to only use the negative derivative and avoid 'Expected to have finished reduction
-            # in the prior iteration before starting a new one.', which otherwise get's
-            # thrown because of setting 'find_unused_parameters=False' in the DDPPlugin
-            neg_dy = neg_dy + y.sum() * 0
-        if "y" in batch and batch.y.ndim == 1:
-            batch.y = batch.y.unsqueeze(1)
+        loss_total = 0
         for loss_name, loss_fn in loss_fn_list:
-            step_losses = self._compute_losses(
-                y, neg_dy,vec, batch, loss_fn, loss_name, stage
-            )
-            if self.hparams.neg_dy_weight > 0:
-                self.losses[stage]["neg_dy"][loss_name].append(
-                    step_losses["neg_dy"].detach()
-                )
-            if self.hparams.y_weight > 0:
-                self.losses[stage]["y"][loss_name].append(step_losses["y"].detach())
-            if self.hparams.dipole_weight > 0:
-                self.losses[stage]["vec"][loss_name].append(step_losses["vec"].detach())
-            total_loss = (
-                step_losses["y"] * self.hparams.y_weight
-                + step_losses["neg_dy"] * self.hparams.neg_dy_weight
-                + step_losses["vec"] * self.hparams.dipole_weight
-            )
-            self.losses[stage]["total"][loss_name].append(total_loss.detach())
-
-        return total_loss
+            step_losses = self._compute_losses(pred, batch, loss_fn, loss_name, stage)
+            for key, loss_value in step_losses.items():
+                weight = self.pred_dict.get(key, 0)
+                if weight > 0:
+                    self.losses[stage][key][loss_name].append(loss_value.detach())
+                    loss_total += weight * loss_value
+            self.losses[stage]["total"][loss_name].append(loss_total.detach())
 
     def optimizer_step(self, *args, **kwargs):
         optimizer = kwargs["optimizer"] if "optimizer" in kwargs else args[2]
@@ -346,59 +303,53 @@ class LNNP(LightningModule):
 
     def on_validation_epoch_end(self):
         if not self.trainer.sanity_checking:
-            # construct dict of logged metrics
+            # --- Construct dict of logged metrics ---
             result_dict = {
                 "epoch": float(self.current_epoch),
                 "lr": self.trainer.optimizers[0].param_groups[0]["lr"],
             }
+
+            # --- Loop over all prediction keys dynamically ---
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
-            result_dict.update(self._get_mean_loss_dict_for_type("y"))
-            result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
-            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
+            for key in self.pred_keys:
+                result_dict.update(self._get_mean_loss_dict_for_type(key))
+
             self.log_dict(result_dict, sync_dist=True)
 
         self._reset_losses_dict()
 
     def on_test_epoch_end(self):
-        # Log all test losses
         if not self.trainer.sanity_checking:
             result_dict = {}
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
-            result_dict.update(self._get_mean_loss_dict_for_type("y"))
-            result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
-            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
-            # Get only test entries
+            for key in self.pred_keys:
+                result_dict.update(self._get_mean_loss_dict_for_type(key))
+
+            # Only keep test entries
             result_dict = {k: v for k, v in result_dict.items() if k.startswith("test")}
             self.log_dict(result_dict, sync_dist=True)
 
     def on_train_epoch_end(self):
-        # Log all train losses
         if not self.trainer.sanity_checking:
             result_dict = {}
             result_dict.update(self._get_mean_loss_dict_for_type("total"))
-            result_dict.update(self._get_mean_loss_dict_for_type("y"))
-            result_dict.update(self._get_mean_loss_dict_for_type("neg_dy"))
-            result_dict.update(self._get_mean_loss_dict_for_type("vec"))
-            # Get only train entries
-            result_dict = {
-                k: v for k, v in result_dict.items() if k.startswith("train")
-            }
+            for key in self.pred_keys:
+                result_dict.update(self._get_mean_loss_dict_for_type(key))
+
+            # Only keep train entries
+            result_dict = {k: v for k, v in result_dict.items() if k.startswith("train")}
             self.log_dict(result_dict, sync_dist=True)
 
     def _reset_losses_dict(self):
-        # Losses has an entry for each stage in ["train", "val", "test"]
-        # Each entry has an entry with "total", "y" and "neg_dy"
-        # Each of these entries has an entry for each loss_fn (e.g. mse_loss)
-        # The loss_fn values are not known in advance
         self.losses = {}
         for stage in ["train", "val", "test"]:
             self.losses[stage] = {}
-            for loss_type in ["total", "y", "neg_dy","vec"]:
+            for loss_type in ["total"] + self.pred_keys:
                 self.losses[stage][loss_type] = defaultdict(list)
 
     def _reset_ema_dict(self):
         self.ema = {}
         for stage in ["train", "val"]:
             self.ema[stage] = {}
-            for loss_type in ["y", "neg_dy","vec"]:
-                self.ema[stage][loss_type] = {}
+            for key in self.pred_keys:
+                self.ema[stage][key] = {}
