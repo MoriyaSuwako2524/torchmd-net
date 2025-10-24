@@ -158,12 +158,16 @@ def create_model(args, prior_model=None, mean=None, std=None):
 
     if "charge" in pred_dict:
         from torchmdnet.models.output_modules import AtomicCharge
+
+        reduce_op_charge = "none"
         output_modules_dict["charge"] = AtomicCharge(
             args["embedding_dimension"],
             activation=args["activation"],
-            reduce_op=args["reduce_op"],
+            reduce_op=reduce_op_charge,
             dtype=dtype,
         )
+
+
 
     # extend here for more (polar, esp, etc.)
     # ==========================================================
@@ -754,12 +758,14 @@ class TorchMD_Net_MultiOutput(nn.Module):
         for key, outmod in self.output_modules.items():
             # --- forward per-head ---
             x_out = outmod.pre_reduce(x, v, z, pos, batch)
-            x_out = x_out * self.std
+            if key != "charge":
+                x_out = x_out * self.std
             if self.prior_model is not None:
                 for prior in self.prior_model:
                     x_out = prior.pre_reduce(x_out, z, pos, batch, extra_args)
             x_out = outmod.reduce(x_out, batch)
-            x_out = x_out + self.mean
+            if key != "charge":
+                x_out = x_out + self.mean
             y = outmod.post_reduce(x_out)
             if self.prior_model is not None:
                 for prior in self.prior_model:

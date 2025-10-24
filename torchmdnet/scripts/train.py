@@ -95,6 +95,13 @@ def get_argparse():
         default={"y": "full_energy.npy", "neg_dy": "full_force.npy"},
         help='Dictionary mapping property name to dataset file name'
     )
+    parser.add_argument(
+    '--ema_dict',
+    type=lambda x: json.loads(x.replace("'", '"')),
+    default={"y": 0.01, "neg_dy": 1.0},
+    help='Dictionary specifying EMA decay factors for each predicted property'
+)
+
 
     # model architecture
     parser.add_argument('--model', type=str, default='graph-network', choices=models.__all_models__, help='Which model to train')

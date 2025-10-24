@@ -207,6 +207,7 @@ class LNNP(LightningModule):
                 extra_args=extra_args,
             )
 
+    
     def _compute_losses(self, pred_dict, batch, loss_fn, loss_name, stage):
         loss_out = {}
         for key in self.pred_keys:
@@ -216,23 +217,19 @@ class LNNP(LightningModule):
                 loss_out[key] = loss_value
         return loss_out
 
+
     def _update_loss_with_ema(self, stage, type, loss_name, loss):
-        # Update the loss using an exponential moving average when applicable
-        # Args:
-        #   stage: stage of the training (train, val, test)
-        #   type: type of loss (y, neg_dy)
-        #   loss_name: name of the loss function
-        #   loss: loss value
-        alpha = getattr(self.hparams, f"ema_alpha_{type}")
-        if stage in ["train", "val"] and alpha < 1 and alpha > 0:
-            ema = (
-                self.ema[stage][type][loss_name]
-                if loss_name in self.ema[stage][type]
-                else loss.detach()
-            )
-            loss = alpha * loss + (1 - alpha) * ema
-            self.ema[stage][type][loss_name] = loss.detach()
+        ema_dict = getattr(self.hparams, "ema_dict", {})
+        alpha = ema_dict.get(type, 1.0)  
+    
+        if stage in ["train", "val"] and 0.0 < alpha < 1.0:
+            ema_store = self.ema.setdefault(stage, {}).setdefault(type, {})
+            ema_prev = ema_store.get(loss_name, loss.detach())
+            loss = alpha * loss + (1 - alpha) * ema_prev
+            ema_store[loss_name] = loss.detach()
+    
         return loss
+
 
     def step(self, batch, loss_fn_list, stage):
         # Run a forward pass and compute the loss for each loss function
@@ -261,6 +258,8 @@ class LNNP(LightningModule):
                 s=batch.s if self.hparams.spin else None,
                 extra_args=extra_args,
             )
+        if hasattr(batch, "charge") and batch.charge.ndim == 1:
+            batch.charge = batch.charge.unsqueeze(1)
         if hasattr(batch, "y") and batch.y.ndim == 1:
             batch.y = batch.y.unsqueeze(1)
         loss_total = 0

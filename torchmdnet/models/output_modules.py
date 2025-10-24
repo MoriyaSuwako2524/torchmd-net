@@ -150,11 +150,11 @@ class AtomicCharge(OutputModel):
         self,
         hidden_channels,
         activation="silu",
-        reduce_op="sum",
+        reduce_op="none",
         dtype=torch.float,
         **kwargs,
     ):
-        super(Charge, self).__init__(
+        super(AtomicCharge, self).__init__(
             allow_prior_model=False, reduce_op=reduce_op
         )
         self.output_network = MLP(
@@ -166,6 +166,8 @@ class AtomicCharge(OutputModel):
             dtype=dtype,
         )
         self.reset_parameters()
+    def reduce(self, x, batch):
+        return x
 
     def reset_parameters(self):
         self.output_network.reset_parameters()
