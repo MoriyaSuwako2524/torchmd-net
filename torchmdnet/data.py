@@ -149,34 +149,37 @@ class DataModule(LightningDataModule):
         return dl
 
     def _standardize(self):
-        def get_energy(batch, atomref):
-            if "y" not in batch or batch.y is None:
-                raise MissingEnergyException()
+        """Compute mean/std for each non-derivative property (e.g. y, charge)."""
+        keys_to_standardize = [
+            k for k in self.dataset.files.keys()
+            if not any(s in k.lower() for s in ["neg_dy","dy", "grad","pos","z","force"])
+        ]
+        print(f"[DataModule] Computing mean/std for: {keys_to_standardize}")
+    
+        stats = {}
+        data_loader = self._get_dataloader(self.train_dataset, "val", store_dataloader=False)
+    
+        for key in keys_to_standardize:
+            ys = []
+            for batch in tqdm(data_loader, desc=f"computing mean/std for {key}"):
+                if not hasattr(batch, key) or getattr(batch, key) is None:
+                    continue
+                yval = getattr(batch, key)
+                if yval.ndim > 1:
+                    # flatten over atoms if per-atom quantity
+                    yval = yval.reshape(-1, yval.shape[-1] if yval.ndim > 1 else 1)
+                ys.append(yval.detach().cpu())
+            if len(ys) == 0:
+                continue
+            ys = torch.cat(ys, dim=0)
+            print(key)
+            stats[key] = {
+                "mean": ys.mean(dim=0),
+                "std": ys.std(dim=0)
+            }
+            print(f"  {key}: mean={stats[key]['mean']}, std={stats[key]['std']}")
+        
+        self._mean = {k: v["mean"] for k, v in stats.items()}
+        self._std = {k: v["std"] for k, v in stats.items()}
 
-            if atomref is None:
-                return batch.y.clone()
-
-            # remove atomref energies from the target energy
-            atomref_energy = scatter(atomref[batch.z], batch.batch, dim=0)
-            return (batch.y.squeeze() - atomref_energy.squeeze()).clone()
-
-        data = tqdm(
-            self._get_dataloader(self.train_dataset, "val", store_dataloader=False),
-            desc="computing mean and std",
-        )
-        try:
-            # only remove atomref energies if the atomref prior is used
-            atomref = self.atomref if self.hparams["prior_model"] == "Atomref" else None
-            # extract energies from the data
-            ys = torch.cat([get_energy(batch, atomref) for batch in data])
-        except MissingEnergyException:
-            rank_zero_warn(
-                "Standardize is true but failed to compute dataset mean and "
-                "standard deviation. Maybe the dataset only contains forces."
-            )
-            return
-
-        # compute mean and standard deviation
-        self._mean = ys.mean(dim=0)
-        self._std = ys.std(dim=0)
 

@@ -163,15 +163,16 @@ def create_model(args, prior_model=None, mean=None, std=None):
         output_modules_dict["charge"] = AtomicCharge(
             args["embedding_dimension"],
             activation=args["activation"],
-            reduce_op=reduce_op_charge,
+            reduce_op=args["reduce_op"],
             dtype=dtype,
+            num_hidden_layers=args.get("output_mlp_num_layers", 0),
         )
 
 
 
     # extend here for more (polar, esp, etc.)
     # ==========================================================
-
+    print(f"output_modules_dict:{output_modules_dict}")
     model = TorchMD_Net_MultiOutput(
         representation_model,
         output_modules_dict,
@@ -225,6 +226,7 @@ def load_ensemble(filepath, args=None, device="cpu", return_std=False, **kwargs)
         model_list,
         return_std=return_std,
     )
+
 
 
 def load_model(filepath, args=None, device="cpu", return_std=False, **kwargs):
@@ -296,6 +298,8 @@ def load_model(filepath, args=None, device="cpu", return_std=False, **kwargs):
 
     model.load_state_dict(state_dict)
     return model.to(device)
+
+
 
 
 def create_prior_models(args, dataset=None):
@@ -713,18 +717,23 @@ class Ensemble(torch.nn.ModuleList):
 
 
 
+import torch
+from torch import nn
+from torch.autograd import grad
+
+
 class TorchMD_Net_MultiOutput(nn.Module):
     """
-    TorchMD-Net variant that supports multiple parallel output heads.
+    TorchMD-Net variant that supports multiple parallel output heads
+    with optional mean/std normalization per head.
 
-    Returns a dict with keys corresponding to each physical quantity, e.g.
-    {"y": energy, "neg_dy": forces, "vec": dipole, "charge": charge, ...}
+    Each output head can have its own mean/std (from DataModule._standardize()).
     """
 
     def __init__(
         self,
         representation_model,
-        output_modules: Dict[str, nn.Module],
+        output_modules: dict[str, nn.Module],
         prior_model=None,
         mean=None,
         std=None,
@@ -740,45 +749,86 @@ class TorchMD_Net_MultiOutput(nn.Module):
             else torch.nn.ModuleList(prior_model).to(dtype=dtype)
         )
         self.derivative = derivative
-        mean = torch.scalar_tensor(0) if mean is None else mean
-        std = torch.scalar_tensor(1) if std is None else std
-        self.register_buffer("mean", mean.to(dtype=dtype))
-        self.register_buffer("std", std.to(dtype=dtype))
 
-    def forward(
-        self, z, pos, batch=None, box=None, q=None, s=None, extra_args=None
-    ):
+        if mean is None:
+            mean = torch.scalar_tensor(0.0, dtype=dtype)
+        if std is None:
+            std = torch.scalar_tensor(1.0, dtype=dtype)
+
+        if isinstance(mean, dict):
+            for k, v in mean.items():
+                self.register_buffer(f"mean_{k}", v.to(dtype=dtype))
+        else:
+            self.register_buffer("mean", mean.to(dtype=dtype))
+
+        if isinstance(std, dict):
+            for k, v in std.items():
+                self.register_buffer(f"std_{k}", v.to(dtype=dtype))
+        else:
+            self.register_buffer("std", std.to(dtype=dtype))
+            
+
+
+    def get_mean_std(self, key):
+        """Return (mean, std) for a given output key."""
+        mean_name = f"mean_{key}"
+        std_name = f"std_{key}"
+        mean = getattr(self, mean_name) if hasattr(self, mean_name) else getattr(self, "mean")
+        std = getattr(self, std_name) if hasattr(self, std_name) else getattr(self, "std")
+        return mean, std
+
+    def forward(self, z, pos, batch=None, box=None, q=None, s=None, extra_args=None):
         batch = torch.zeros_like(z) if batch is None else batch
         if self.derivative:
             pos.requires_grad_(True)
 
         x, v, z, pos, batch = self.representation_model(z, pos, batch, box=box, q=q, s=s)
-
         results = {}
+
         for key, outmod in self.output_modules.items():
-            # --- forward per-head ---
+            mean, std = self.get_mean_std(key)
             x_out = outmod.pre_reduce(x, v, z, pos, batch)
-            if key != "charge":
-                x_out = x_out * self.std
+
+            x_out = x_out * std
+
             if self.prior_model is not None:
                 for prior in self.prior_model:
                     x_out = prior.pre_reduce(x_out, z, pos, batch, extra_args)
+
             x_out = outmod.reduce(x_out, batch)
-            if key != "charge":
-                x_out = x_out + self.mean
+            x_out = x_out + mean 
+
             y = outmod.post_reduce(x_out)
+
             if self.prior_model is not None:
                 for prior in self.prior_model:
                     y = prior.post_reduce(y, z, pos, batch, box, extra_args)
+
             results[key] = y
 
-        # --- compute forces if needed ---
         if self.derivative and "y" in results:
             grad_outputs = [torch.ones_like(results["y"])]
-            dy = grad([results["y"]], [pos],
-                      grad_outputs=grad_outputs,
-                      create_graph=self.training,
-                      retain_graph=self.training)[0]
+            dy = grad(
+                [results["y"]],
+                [pos],
+                grad_outputs=grad_outputs,
+                create_graph=self.training,
+                retain_graph=self.training,
+            )[0]
             results["neg_dy"] = -dy
 
         return results
+    def load_state_dict(self, state_dict, strict=True, assign=False,dtype=torch.float32):
+        print(f"Load state dict output modules dict:{self.output_modules.items()}")
+        for key, outmod in self.output_modules.items():
+            
+            mean_name = f"mean_{key}"
+            std_name = f"std_{key}"
+            
+            self.register_buffer(f"mean_{key}", state_dict[mean_name].to(dtype=dtype))
+            self.register_buffer(f"std_{key}", state_dict[std_name].to(dtype=dtype))
+        return super().load_state_dict(state_dict, strict=False, assign=assign)
+
+
+
+

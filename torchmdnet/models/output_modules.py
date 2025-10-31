@@ -150,7 +150,7 @@ class AtomicCharge(OutputModel):
         self,
         hidden_channels,
         activation="silu",
-        reduce_op="none",
+        reduce_op="sum",
         dtype=torch.float,
         **kwargs,
     ):
